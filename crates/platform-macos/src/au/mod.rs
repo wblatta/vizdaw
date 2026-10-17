@@ -7,15 +7,16 @@
 
 mod ffi;
 
+use core_engine::backend::BlockInfo;
 use core_engine::graph::ProcessStatus;
 use core_host::catalog::Source;
 use core_host::{
     AudioPortInfo, AudioProcessor, HostError, InstanceEvents, LoadRequest, ParamEvent, ParamInfo,
-    PluginEditor, PluginFormat, PluginInfo, PluginInstance, PluginKind, PortRole, PrepareJob,
-    Prepared, ProcessCtx, Tail,
+    ParentView, PluginEditor, PluginFormat, PluginInfo, PluginInstance, PluginKind, PortRole,
+    PrepareJob, Prepared, ProcessCtx, Tail,
 };
 use core_model::mixer::{ParamId, PluginFormat as Format, PluginRef};
-use ffi::{ComponentInfo, Feed, GestureListener, Unit};
+use ffi::{ComponentInfo, Feed, GestureListener, HostTransport, Unit};
 use objc2_audio_toolbox::{
     AudioUnitParameterOptions, kAudioUnitScope_Input, kAudioUnitScope_Output,
     kAudioUnitType_Effect, kAudioUnitType_MusicDevice, kAudioUnitType_MusicEffect,
@@ -156,6 +157,9 @@ struct Opened {
     kind: u32,
     config: (f64, u32),
     feed: Feed,
+    /// What its host callbacks read (installed when the unit took them).
+    transport: Arc<HostTransport>,
+    callbacks: bool,
 }
 
 /// The AU [`PluginFormat`].
@@ -184,14 +188,30 @@ impl PluginFormat for AuFormat {
             // The input callbacks are set while uninitialized: some units
             // take their connections only at initialization.
             let feed = Feed::new(max);
-            connect(&unit, &feed)?;
-            unit.initialize().map_err(HostError::ActivateFailed)?;
+            // On a failure below, the unit is disposed explicitly before
+            // `feed` and `transport` drop: it must never hold their
+            // addresses (input-callback and host-callback contexts) after
+            // they are freed. Locals would drop the other way round.
+            if let Err(e) = connect(&unit, &feed) {
+                drop(unit);
+                return Err(e);
+            }
+            // Tempo and position for tempo-synced units (spec §5); a unit
+            // that refuses the callbacks still plays.
+            let transport = Arc::new(HostTransport::new(sr));
+            let callbacks = unit.set_host_callbacks(&transport).is_ok();
+            if let Err(e) = unit.initialize() {
+                drop(unit);
+                return Err(HostError::ActivateFailed(e));
+            }
             Ok(Prepared(Box::new(Opened {
                 desc: describe(&c),
                 kind: c.kind,
                 unit,
                 config: (sr, max),
                 feed,
+                transport,
+                callbacks,
             })))
         })
     }
@@ -315,8 +335,11 @@ impl HostWrites {
 
 /// A loaded AU (main-thread half).
 pub struct AuInstance {
-    // Declared first so it is dropped first: the listener's registrations
-    // go before the unit is disposed.
+    // Declared first so it is dropped first: its view leaves the window
+    // before anything else of the unit goes.
+    editor: AuEditor,
+    // Dropped next: the listener's registrations go before the unit is
+    // disposed.
     listener: Option<GestureListener>,
     unit: Arc<Unit>,
     kind: u32,
@@ -330,6 +353,9 @@ pub struct AuInstance {
     /// activation at that configuration hands it to the processor without
     /// initializing the unit again.
     ready: Option<Feed>,
+    /// What the unit's host callbacks read.
+    transport: Arc<HostTransport>,
+    callbacks: bool,
     /// Initializations done by `activate` (on the main thread).
     #[cfg(test)]
     main_inits: u32,
@@ -348,8 +374,13 @@ impl AuInstance {
         let latency = Arc::new(AtomicBool::new(false));
         // A unit that cannot report latency changes still works.
         let _ = o.unit.watch_latency(Arc::clone(&latency));
+        let unit = Arc::new(o.unit);
         let mut me = AuInstance {
-            unit: Arc::new(o.unit),
+            editor: AuEditor {
+                unit: Arc::clone(&unit),
+                view: None,
+            },
+            unit,
             kind: o.kind,
             info: PluginInfo {
                 plugin: o.desc.plugin,
@@ -367,6 +398,8 @@ impl AuInstance {
             listener: None,
             writes: Arc::new(HostWrites::new(Vec::new())),
             ready: Some(o.feed),
+            transport: o.transport,
+            callbacks: o.callbacks,
             #[cfg(test)]
             main_inits: 0,
         };
@@ -463,6 +496,12 @@ impl AuInstance {
         };
     }
 
+    /// Whether the unit took VizDAW's host callbacks (tempo, beat
+    /// position, transport state).
+    pub fn host_callbacks_installed(&self) -> bool {
+        self.callbacks
+    }
+
     /// Acts like the plugin's own UI changing parameter `id` (begin
     /// gesture, value, end gesture). For tests: Apple's built-in units have
     /// no scriptable UI.
@@ -511,11 +550,14 @@ impl PluginInstance for AuInstance {
         // is a change after this point (`read_info` reads the latency next).
         self.latency.store(false, Ordering::Release);
         self.config = Some((sample_rate, max_frames));
+        self.transport.set_rate(sample_rate);
         self.read_info();
         self.active = true;
         Ok(Box::new(AuProcessor {
             unit: Arc::clone(&self.unit),
             writes: Arc::clone(&self.writes),
+            transport: Arc::clone(&self.transport),
+            last: None,
             feed,
             sample_time: 0.0,
             out_counts: self
@@ -566,9 +608,8 @@ impl PluginInstance for AuInstance {
     }
 
     fn editor(&mut self) -> Option<&mut dyn PluginEditor> {
-        // AU editors (view controllers, Cocoa UI) arrive with the app's
-        // plugin windows (3c, Plan Ruling 7).
-        None
+        // Every unit has one: its own view, or the generic view.
+        Some(&mut self.editor)
     }
 
     fn idle(&mut self) -> InstanceEvents {
@@ -609,10 +650,82 @@ impl PluginInstance for AuInstance {
     }
 }
 
+/// How long opening an AU v3 editor waits for its view controller.
+pub const V3_VIEW_WAIT: Duration = Duration::from_secs(3);
+
+/// An AU's editor (spec §9): the unit's own view (AU v2 Cocoa UI, AU v3
+/// view controller) or CoreAudioKit's generic view, added to the window's
+/// parent view. Fixed size: AU views size themselves.
+pub struct AuEditor {
+    unit: Arc<Unit>,
+    view: Option<ffi::View>,
+}
+
+impl std::fmt::Debug for AuEditor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuEditor")
+            .field("open", &self.view.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuEditor {
+    /// Where the open view came from: `"cocoa"`, `"controller"` or
+    /// `"generic"` (`None` while closed).
+    pub fn view_kind(&self) -> Option<&'static str> {
+        self.view.as_ref().map(|v| match v.kind {
+            ffi::ViewKind::Cocoa => "cocoa",
+            ffi::ViewKind::Controller => "controller",
+            ffi::ViewKind::Generic => "generic",
+        })
+    }
+}
+
+impl PluginEditor for AuEditor {
+    fn open(&mut self, parent: ParentView) -> Result<(u32, u32), HostError> {
+        self.close();
+        let view = self
+            .unit
+            .editor_view(V3_VIEW_WAIT)
+            .map_err(HostError::EditorUnavailable)?;
+        let size = view
+            .attach(parent.as_ptr())
+            .map_err(HostError::EditorUnavailable)?;
+        self.view = Some(view);
+        Ok(size)
+    }
+
+    fn resize(&mut self, _width: u32, _height: u32) -> Result<(u32, u32), HostError> {
+        self.view
+            .as_ref()
+            .map(ffi::View::size)
+            .ok_or_else(|| HostError::EditorUnavailable("not open".into()))
+    }
+
+    fn can_resize(&mut self) -> bool {
+        false
+    }
+
+    fn close(&mut self) {
+        self.view = None;
+    }
+}
+
+impl AuInstance {
+    /// The editor, typed (tests read [`AuEditor::view_kind`]).
+    pub fn au_editor(&mut self) -> &mut AuEditor {
+        &mut self.editor
+    }
+}
+
 /// The real-time half of an [`AuInstance`].
 pub struct AuProcessor {
     unit: Arc<Unit>,
     writes: Arc<HostWrites>,
+    /// What the unit's host callbacks read; set before each render.
+    transport: Arc<HostTransport>,
+    /// The previous block's playing frame and length.
+    last: Option<(u64, u32)>,
     feed: Feed,
     sample_time: f64,
     out_counts: Vec<usize>,
@@ -628,6 +741,7 @@ impl std::fmt::Debug for AuProcessor {
 impl AudioProcessor for AuProcessor {
     fn process(&mut self, ctx: &mut ProcessCtx<'_>) -> ProcessStatus {
         let n = ctx.frames.min(self.max_frames);
+        store_block(&self.transport, &mut self.last, ctx.transport, n);
         for p in ctx.params_in {
             if let Ok(id) = u32::try_from(p.id.0) {
                 self.writes.note(id, p.value as f32);
@@ -666,6 +780,76 @@ impl AudioProcessor for AuProcessor {
     fn reset(&mut self) {
         self.unit.reset();
     }
+}
+
+/// Stores one block's transport facts for the host callbacks; a playing
+/// block that does not follow the previous one is a jump. // RT
+fn store_block(t: &HostTransport, last: &mut Option<(u64, u32)>, info: &BlockInfo, n: u32) {
+    let expected = match last {
+        Some((frame, len)) if info.playing => *frame + u64::from(*len),
+        _ => info.frame,
+    };
+    t.set(
+        info.playing,
+        info.frame,
+        info.beats,
+        info.tempo_bpm,
+        expected,
+    );
+    *last = info.playing.then_some((info.frame, n));
+}
+
+/// What an AU's host callbacks report (`kAudioUnitProperty_HostCallbacks`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HostCallbacksSeen {
+    /// Quarter-note position.
+    pub beat: f64,
+    /// Tempo in BPM.
+    pub tempo: f64,
+    /// Frames from the block start to the next whole beat.
+    pub to_next_beat: u32,
+    /// Time signature numerator.
+    pub numerator: f32,
+    /// Time signature denominator.
+    pub denominator: u32,
+    /// Beat of the current bar's downbeat.
+    pub downbeat: f64,
+    /// The transport plays.
+    pub playing: bool,
+    /// Playing toggled or the position jumped since the last read.
+    pub changed: bool,
+    /// Schedule frame of the block start.
+    pub sample: f64,
+}
+
+/// Calls the host callbacks the way a unit does after a processor stored
+/// `blocks` (each with its frame count), at `rate`. For tests: Apple's
+/// built-in units do not ask for the transport.
+pub fn host_callbacks_after(rate: f64, blocks: &[(BlockInfo, u32)]) -> Vec<HostCallbacksSeen> {
+    let t = HostTransport::new(rate);
+    let mut last = None;
+    blocks
+        .iter()
+        .map(|(info, n)| {
+            store_block(&t, &mut last, info, *n);
+            let (
+                (beat, tempo),
+                (to_next_beat, numerator, denominator, downbeat),
+                (playing, changed, sample),
+            ) = ffi::call_host_callbacks(&t);
+            HostCallbacksSeen {
+                beat,
+                tempo,
+                to_next_beat,
+                numerator,
+                denominator,
+                downbeat,
+                playing,
+                changed,
+                sample,
+            }
+        })
+        .collect()
 }
 
 /// Loads a component for the scanner and the tests: instantiate, configure

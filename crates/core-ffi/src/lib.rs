@@ -16,16 +16,72 @@
 
 uniffi::setup_scaffolding!();
 
+pub mod blocks;
+pub mod catalog;
+pub mod clock;
+pub mod edit;
+pub mod editor;
 pub mod error;
+pub mod events;
 pub mod guard;
 pub mod host;
+pub mod input;
+pub mod mixer;
+pub mod modify;
+pub mod plugins;
+pub mod recovery;
+pub mod revs;
+pub mod selection;
 pub mod session;
 pub mod snapshot;
+pub mod templates;
 
+pub use blocks::{BlockKind, BlockRow, BlockRule};
+pub use catalog::{
+    CatalogConfig, CatalogRowFfi, PluginCatalog, PluginKey, PluginKindTag, PluginStatusRow,
+    ScanProgress,
+};
+pub use edit::{
+    AudioEdit, EditCommand, EventEdit, GeneratorRow, LaneEdit, LaneRef, QuantizeRow, ReferenceEdit,
+    SequenceEdit, ViewFilterRow,
+};
+pub use editor::EditorSize;
 pub use error::VizError;
+pub use events::{
+    EventKindRow, EventRow, FadeRow, FadeShapeRow, GroupChannel, LaneEvents, MarkerRow,
+    MeterEntryRow, NoteAttributeRow, PerNoteKindRow, PerNotePoint, PerNoteValueRow, SequenceInfo,
+    TempoPointRow, TextKindRow,
+};
 pub use guard::ffi_guard;
-pub use session::Session;
-pub use snapshot::{DocSnapshot, LaneRow, SeqRow, TransportState};
+pub use input::{NoteInRow, NoteInput};
+pub use mixer::{
+    BusRow, DestRow, MeterRow, MixerLevels, MixerSnapshot, SendRow, StripKindRow, StripRow,
+};
+pub use modify::{
+    AmountRow, ChangeOpRow, ConditionRow, ConditionTest, CurveRow, ModifyRow, ModifyTemplateRow,
+    NoteMapEntry, RuleRow, SelectModeRow, SettingsEdit, SubstituteRow, ValueTargetRow, WaveRow,
+};
+pub use recovery::RecoveryInfo;
+pub use revs::LaneRev;
+pub use selection::{SelectionRow, TickRange};
+pub use session::{OpenOptions, Session};
+pub use snapshot::{
+    DocSnapshot, IdleUpdate, KeySlotRow, LaneRow, ParamRow, ParamValue, PluginFormatTag,
+    PluginRefRow, SeqRow, SlotRow, SlotStatus, TransportState,
+};
+pub use templates::SequenceTemplate;
+
+/// The app is quitting: stops and drops the engine host so no plugin
+/// host is still rendering when thread-local destructors run at exit.
+/// Call on the main thread after every session was closed; a later Play
+/// would simply create a new host.
+#[uniffi::export]
+pub fn shutdown() -> Result<(), VizError> {
+    ffi_guard(|| {
+        host::reset();
+        Ok(())
+    })
+}
 
 /// Panics inside the guard (test hook): returns `VizError::Internal`.
 #[cfg(feature = "test-hooks")]
